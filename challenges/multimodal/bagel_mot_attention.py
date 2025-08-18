@@ -9,6 +9,17 @@ from torch.nn.attention.flex_attention import flex_attention, or_masks, and_mask
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
 
+
+# 尝试导入你自己的包
+try:
+    import custom_attention
+    IS_CUSTOM_ATTENTION_AVAILABLE = True
+    print("✅ Custom attention kernel successfully imported.")
+except ImportError:
+    IS_CUSTOM_ATTENTION_AVAILABLE = False
+    print("⚠️ Custom attention kernel not found. Falling back to native PyTorch implementation.")
+
+
 from flash_attn import flash_attn_varlen_func
 
 
@@ -44,6 +55,23 @@ if is_flash_attn_2_available():
     
 from transformers.modeling_rope_utils import rope_config_validation
 
+import time
+from functools import wraps
+def timeit(func):
+    """一个用于测量函数执行时间的装饰器。"""
+    @wraps(func)  # @wraps 确保被装饰的函数的元信息（如函数名、文档字符串）不会丢失
+    def wrapper(*args, **kwargs):
+        # 在调用原始函数前记录时间
+        start_time = time.perf_counter()
+        # 调用原始函数，并获取其返回值
+        result = func(*args, **kwargs)
+        # 在调用原始函数后记录时间
+        end_time = time.perf_counter()
+        elapsed_time = (end_time - start_time)*1000
+        print(f"function '{func.__name__}' costs {elapsed_time:.4f} ms.")
+        # 返回原始函数的返回值
+        return result
+    return wrapper
 
 
 # Copied from transformers.models.llama.modeling_llama.rotate_half
@@ -273,6 +301,16 @@ class Qwen2Attention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    相当于 torch.repeat_interleave(x, dim=1, repeats=n_rep)。
+    (batch, num_key_value_heads, seqlen, head_dim) -> (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 class PackedAttentionMoT(Qwen2Attention):
     def __init__(
@@ -288,6 +326,7 @@ class PackedAttentionMoT(Qwen2Attention):
         rms_norm_eps,
         freeze_und: bool,
         layer_idx,
+        use_custom_kernel: bool = False # judge which kernel to use
     ):
         super().__init__(
             hidden_size,
@@ -315,7 +354,12 @@ class PackedAttentionMoT(Qwen2Attention):
         self.k_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.v_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        ############# new add ################
+        if use_custom_kernel and not IS_CUSTOM_ATTENTION_AVAILABLE:
+            raise ImportError("`use_custom_kernel=True` but the 'custom_attention' package could not be imported.")
+        self.use_custom_kernel = use_custom_kernel
 
+    @timeit
     def forward_train(
         self,
         packed_sequence: torch.Tensor,
@@ -365,43 +409,82 @@ class PackedAttentionMoT(Qwen2Attention):
             packed_query_states_, packed_key_states_, packed_cos, packed_sin, unsqueeze_dim=1
         )
 
-        if isinstance(attention_mask, List):
-            # help understand the else branch
-            packed_key_states_ = packed_key_states_[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
-            packed_key_states_ = packed_key_states_.reshape(-1, self.num_heads, self.head_dim)
-            packed_value_states = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
-            packed_value_states = packed_value_states.reshape(-1, self.num_heads, self.head_dim)
+        if self.use_custom_kernel:
+            # --- 路径 A: 调用我们自己的 CUDA Kernel ---
+            print("   (正在使用自定义 CUDA Kernel...)")
 
-            unpacked_query_states = packed_query_states_.transpose(0, 1).split(sample_lens, dim=1)
-            unpacked_key_states = packed_key_states_.transpose(0, 1).split(sample_lens, dim=1)
-            unpacked_value_states = packed_value_states.transpose(0, 1).split(sample_lens, dim=1)
-            upacked_attn_output = []
-            for query_states, key_states, value_states, attention_mask_per_sample in zip(
-                unpacked_query_states, unpacked_key_states, unpacked_value_states, attention_mask
-            ):
-                with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
-                    attn_output = scaled_dot_product_attention(
-                        query_states.to(torch.bfloat16).unsqueeze(0), 
-                        key_states.to(torch.bfloat16).unsqueeze(0), 
-                        value_states.to(torch.bfloat16).unsqueeze(0),
-                        attention_mask_per_sample.to(torch.bfloat16).unsqueeze(0),
-                    )
-                upacked_attn_output.append(attn_output.squeeze(0))
-            packed_attn_output = torch.cat(upacked_attn_output, dim=1)
+            # [重要修正]：在形状变换前，先处理 GQA
+            # 将 K 和 V 的头重复，以匹配 Q 的头数
+            # packed_..._ 的形状是 (TotalSeqLen, NumKeyValueHeads, HeadDim)
+            # 我们先增加一个 batch 维度
+            k_gqa = packed_key_states_.unsqueeze(0)
+            v_gqa = packed_value_states.unsqueeze(0)
+            
+            # 调用 repeat_kv 进行复制
+            k_gqa = repeat_kv(k_gqa, self.num_key_value_groups)
+            v_gqa = repeat_kv(v_gqa, self.num_key_value_groups)
+
+            # 去掉 batch 维度，恢复 packed 形状
+            k_repeated = k_gqa.squeeze(0)
+            v_repeated = v_gqa.squeeze(0)
+            
+            # 准备输入：我们的自定义 Kernel 期望 (B, H, S, D) 形状
+            # 使用已经处理好 GQA 的 k_repeated 和 v_repeated
+            q = packed_query_states_.permute(1, 0, 2).unsqueeze(0)
+            k = k_repeated.permute(1, 0, 2).unsqueeze(0)
+            v = v_repeated.permute(1, 0, 2).unsqueeze(0)
+
+            # 适配 Mask
+            mask = attention_mask[0] if isinstance(attention_mask, List) else attention_mask
+
+            attn_output_custom = custom_attention.forward(q, k, v, mask)
+
+            # 恢复形状以匹配后续代码
+            packed_attn_output = attn_output_custom.squeeze(0).permute(1, 0, 2)
+            
         else:
-            pad_size = sum(sample_lens) - packed_query_states.shape[0]
-            packed_query_states_ = pad_sequence(packed_query_states_.permute(1, 0, 2), pad_size)
-            packed_key_states_ = pad_sequence(packed_key_states_.permute(1, 0, 2), pad_size)
-            packed_value_states = pad_sequence(packed_value_states.permute(1, 0, 2), pad_size)
-            packed_attn_output = flex_attention(
-                packed_query_states_.unsqueeze(0), # 1, num_head, L, head_dim
-                packed_key_states_.unsqueeze(0), 
-                packed_value_states.unsqueeze(0), 
-                enable_gqa=True,
-                block_mask=attention_mask,
-            )
-            end_index = packed_attn_output.shape[2] - pad_size
-            packed_attn_output = packed_attn_output[0, :, :end_index, :]
+            # --- 路径 B: 使用原始的 PyTorch 实现 (保持不变) ---
+            print("   (正在使用原生 PyTorch Attention...)")
+
+            if isinstance(attention_mask, List):
+                # help understand the else branch
+                packed_key_states_ = packed_key_states_[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+                packed_key_states_ = packed_key_states_.reshape(-1, self.num_heads, self.head_dim)
+                packed_value_states = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+                packed_value_states = packed_value_states.reshape(-1, self.num_heads, self.head_dim)
+
+                unpacked_query_states = packed_query_states_.transpose(0, 1).split(sample_lens, dim=1)
+                unpacked_key_states = packed_key_states_.transpose(0, 1).split(sample_lens, dim=1)
+                unpacked_value_states = packed_value_states.transpose(0, 1).split(sample_lens, dim=1)
+                upacked_attn_output = []
+                for query_states, key_states, value_states, attention_mask_per_sample in zip(
+                    unpacked_query_states, unpacked_key_states, unpacked_value_states, attention_mask
+                ):
+                    with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
+                        # 注意力机制调用部分
+                        attn_output = scaled_dot_product_attention(
+                            query_states.to(torch.bfloat16).unsqueeze(0), 
+                            key_states.to(torch.bfloat16).unsqueeze(0), 
+                            value_states.to(torch.bfloat16).unsqueeze(0),
+                            attn_mask=attention_mask_per_sample.to(torch.bfloat16).unsqueeze(0),
+                        )
+                    upacked_attn_output.append(attn_output.squeeze(0))
+                packed_attn_output = torch.cat(upacked_attn_output, dim=1)
+            else:
+                pad_size = sum(sample_lens) - packed_query_states.shape[0]
+                packed_query_states_ = pad_sequence(packed_query_states_.permute(1, 0, 2), pad_size)
+                packed_key_states_ = pad_sequence(packed_key_states_.permute(1, 0, 2), pad_size)
+                packed_value_states = pad_sequence(packed_value_states.permute(1, 0, 2), pad_size)
+                # 注意力机制调用部分
+                packed_attn_output = flex_attention(
+                    packed_query_states_.unsqueeze(0), # 1, num_head, L, head_dim
+                    packed_key_states_.unsqueeze(0), 
+                    packed_value_states.unsqueeze(0), 
+                    enable_gqa=True,
+                    block_mask=attention_mask,
+                )
+                end_index = packed_attn_output.shape[2] - pad_size
+                packed_attn_output = packed_attn_output[0, :, :end_index, :]
 
         packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.num_heads * self.head_dim)
         packed_attn_output_ = packed_attn_output.new_zeros(packed_attn_output.shape)
@@ -409,7 +492,7 @@ class PackedAttentionMoT(Qwen2Attention):
         packed_attn_output_[packed_gen_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_gen_token_indexes])
 
         return packed_attn_output_
-
+    @timeit
     def forward_inference(
         self,
         packed_query_sequence: torch.Tensor,
