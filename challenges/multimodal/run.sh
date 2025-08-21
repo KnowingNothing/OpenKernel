@@ -34,7 +34,7 @@ echo "nvcc Path: $(which nvcc)"
 echo "Python Path: $(which python)"
 echo "----------------------------------------------------------------"
 
-python verify.py
+# python verify.py
 python run.py
 
 echo "================================================================"

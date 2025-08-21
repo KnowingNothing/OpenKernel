@@ -21,6 +21,12 @@ head_dim = 16
 device = torch.device("cuda")
 dtype = torch.float32
 
+### 466 is a magical number that can bring great good luck ###
+# SEED = 466
+# torch.manual_seed(SEED)
+# if torch.cuda.is_available():
+#     torch.cuda.manual_seed_all(SEED)
+
 # Create random input tensors
 q = torch.rand(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
 k = torch.rand(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)

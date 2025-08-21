@@ -358,7 +358,7 @@ class PackedAttentionMoT(Qwen2Attention):
             raise ImportError("`use_custom_kernel=True` but the 'custom_attention' package could not be imported.")
         self.use_custom_kernel = use_custom_kernel
 
-    @timeit
+    # @timeit
     def forward_train(
         self,
         packed_sequence: torch.Tensor,
@@ -491,7 +491,7 @@ class PackedAttentionMoT(Qwen2Attention):
         packed_attn_output_[packed_gen_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_gen_token_indexes])
 
         return packed_attn_output_
-    @timeit
+    # @timeit
     def forward_inference(
         self,
         packed_query_sequence: torch.Tensor,
