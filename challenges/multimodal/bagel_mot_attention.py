@@ -10,7 +10,7 @@ from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
 
 
-# 尝试导入你自己的包
+# Attempt to import your own package
 try:
     import custom_attention
     IS_CUSTOM_ATTENTION_AVAILABLE = True
@@ -58,18 +58,17 @@ from transformers.modeling_rope_utils import rope_config_validation
 import time
 from functools import wraps
 def timeit(func):
-    """一个用于测量函数执行时间的装饰器。"""
-    @wraps(func)  # @wraps 确保被装饰的函数的元信息（如函数名、文档字符串）不会丢失
+    """A decorator to measure the execution time of a function."""
+    @wraps(func)  # @wraps ensures that the metadata of the decorated function (like name, docstring) is preserved
     def wrapper(*args, **kwargs):
-        # 在调用原始函数前记录时间
         start_time = time.perf_counter()
-        # 调用原始函数，并获取其返回值
+
         result = func(*args, **kwargs)
-        # 在调用原始函数后记录时间
+
         end_time = time.perf_counter()
         elapsed_time = (end_time - start_time)*1000
         print(f"function '{func.__name__}' costs {elapsed_time:.4f} ms.")
-        # 返回原始函数的返回值
+
         return result
     return wrapper
 
@@ -160,7 +159,7 @@ def create_sparse_mask(document_lens, split_lens, attn_modes, device):
     return and_masks(or_masks(causal_mask, full_and_noise_mask), remove_noise_mask, sample_mask)
 
 
-  
+ 
 class NaiveCache:
     def __init__(self, num_layers):
         self.key_cache = {k: None for k in range(num_layers)}
@@ -303,7 +302,7 @@ class Qwen2Attention(nn.Module):
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
-    相当于 torch.repeat_interleave(x, dim=1, repeats=n_rep)。
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep).
     (batch, num_key_value_heads, seqlen, head_dim) -> (batch, num_attention_heads, seqlen, head_dim)
     """
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
@@ -410,41 +409,41 @@ class PackedAttentionMoT(Qwen2Attention):
         )
 
         if self.use_custom_kernel:
-            # --- 路径 A: 调用我们自己的 CUDA Kernel ---
-            print("   (正在使用自定义 CUDA Kernel...)")
+            # --- Path A: Call our own CUDA Kernel ---
+            print("(Using a custom CUDA Kernel...)")
 
-            # [重要修正]：在形状变换前，先处理 GQA
-            # 将 K 和 V 的头重复，以匹配 Q 的头数
-            # packed_..._ 的形状是 (TotalSeqLen, NumKeyValueHeads, HeadDim)
-            # 我们先增加一个 batch 维度
+            # [Important Fix]: Handle GQA before reshaping
+            # Repeat the heads of K and V to match the number of heads in Q
+            # The shape of packed_..._ is (TotalSeqLen, NumKeyValueHeads, HeadDim)
+            # First, we add a batch dimension
             k_gqa = packed_key_states_.unsqueeze(0)
             v_gqa = packed_value_states.unsqueeze(0)
             
-            # 调用 repeat_kv 进行复制
+            # Call repeat_kv for replication
             k_gqa = repeat_kv(k_gqa, self.num_key_value_groups)
             v_gqa = repeat_kv(v_gqa, self.num_key_value_groups)
 
-            # 去掉 batch 维度，恢复 packed 形状
+            # Remove the batch dimension to restore the packed shape
             k_repeated = k_gqa.squeeze(0)
             v_repeated = v_gqa.squeeze(0)
             
-            # 准备输入：我们的自定义 Kernel 期望 (B, H, S, D) 形状
-            # 使用已经处理好 GQA 的 k_repeated 和 v_repeated
+            # Prepare inputs: Our custom kernel expects the shape (B, H, S, D)
+            # Use the GQA-processed k_repeated and v_repeated
             q = packed_query_states_.permute(1, 0, 2).unsqueeze(0)
             k = k_repeated.permute(1, 0, 2).unsqueeze(0)
             v = v_repeated.permute(1, 0, 2).unsqueeze(0)
 
-            # 适配 Mask
+            # Adapt the Mask
             mask = attention_mask[0] if isinstance(attention_mask, List) else attention_mask
 
             attn_output_custom = custom_attention.forward(q, k, v, mask)
 
-            # 恢复形状以匹配后续代码
+            # Reshape to match the subsequent code
             packed_attn_output = attn_output_custom.squeeze(0).permute(1, 0, 2)
             
         else:
-            # --- 路径 B: 使用原始的 PyTorch 实现 (保持不变) ---
-            print("   (正在使用原生 PyTorch Attention...)")
+            # --- Path B: Use the original PyTorch implementation (unchanged) ---
+            print("   (Using native PyTorch Attention...)")
 
             if isinstance(attention_mask, List):
                 # help understand the else branch
@@ -461,7 +460,7 @@ class PackedAttentionMoT(Qwen2Attention):
                     unpacked_query_states, unpacked_key_states, unpacked_value_states, attention_mask
                 ):
                     with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
-                        # 注意力机制调用部分
+                        # Attention mechanism call part
                         attn_output = scaled_dot_product_attention(
                             query_states.to(torch.bfloat16).unsqueeze(0), 
                             key_states.to(torch.bfloat16).unsqueeze(0), 
@@ -475,7 +474,7 @@ class PackedAttentionMoT(Qwen2Attention):
                 packed_query_states_ = pad_sequence(packed_query_states_.permute(1, 0, 2), pad_size)
                 packed_key_states_ = pad_sequence(packed_key_states_.permute(1, 0, 2), pad_size)
                 packed_value_states = pad_sequence(packed_value_states.permute(1, 0, 2), pad_size)
-                # 注意力机制调用部分
+                # Attention mechanism call part
                 packed_attn_output = flex_attention(
                     packed_query_states_.unsqueeze(0), # 1, num_head, L, head_dim
                     packed_key_states_.unsqueeze(0), 

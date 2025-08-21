@@ -10,10 +10,10 @@
     } \
 } while (0)
 
-// Kernel 1: Scaled Dot-Product (增加了 Mask 支持)
+// Kernel 1: Scaled Dot-Product
 __global__ void scaled_dot_product_kernel_naive(
     const float* q_data, const float* k_data, 
-    const float* mask_data,      // <--- 定义: 增加了 mask_data 指针
+    const float* mask_data,     
     float* scores_data,
     int seq_len, int head_dim, float scale) 
 {
@@ -39,7 +39,7 @@ __global__ void scaled_dot_product_kernel_naive(
     scores_data[query_idx * seq_len + key_idx] = sum * scale;
 }
 
-// Kernel 2: Row-wise Softmax (朴素实现, 无需改动)
+// Kernel 2: Row-wise Softmax
 __global__ void softmax_kernel_naive(const float* scores_data, float* weights_data, int seq_len)
 {
     const int row = blockIdx.x;
@@ -54,7 +54,7 @@ __global__ void softmax_kernel_naive(const float* scores_data, float* weights_da
     row_output[col] = expf(row_input[col] - max_val) / sum_val;
 }
 
-// Kernel 3: Matrix Multiply (朴素实现, 无需改动)
+// Kernel 3: Matrix Multiply 
 __global__ void matrix_multiply_kernel_naive(
     const float* A, const float* B, float* C, int M, int N, int K)
 {
@@ -66,9 +66,8 @@ __global__ void matrix_multiply_kernel_naive(
     C[row * N + col] = sum;
 }
 
-// Host-side C++ function (CPU 端主调用函数)
+// Host-side C++ function 
 extern "C" {
-// 【修正1】: 更新 Host 函数签名，增加 const float* mask_data
 void attention_forward_cuda(
     const float* q_data,
     const float* k_data,
@@ -98,7 +97,6 @@ void attention_forward_cuda(
         dim3 blocks_scores((seq_len + threads_scores.x - 1) / threads_scores.x,
                            (seq_len + threads_scores.y - 1) / threads_scores.y);
         
-        // 【修正2】: 更新 Kernel 启动调用，传入 mask_data 指针
         scaled_dot_product_kernel_naive<<<blocks_scores, threads_scores>>>(
             q_ptr, k_ptr, mask_data, score_ptr, seq_len, head_dim, scale
         );
