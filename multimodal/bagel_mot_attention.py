@@ -8,6 +8,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import flex_attention, or_masks, and_masks
 from torch.nn.functional import scaled_dot_product_attention
 from transformers.utils import ModelOutput
+import torch.nn.functional as F
 
 
 # Attempt to import your own package
@@ -20,7 +21,7 @@ except ImportError:
     print("⚠️ Custom attention kernel not found. Falling back to native PyTorch implementation.")
 
 
-from flash_attn import flash_attn_varlen_func
+# from flash_attn import flash_attn_varlen_func
 
 
 import math
@@ -508,6 +509,7 @@ class PackedAttentionMoT(Qwen2Attention):
         packed_text_indexes=None,
     ):
         if mode == 'und':
+            # 投影并调整形状为 [seq_len, num_heads, head_dim]
             packed_query_states = self.q_proj(packed_query_sequence).view(-1, self.num_heads, self.head_dim)
             packed_key_states = self.k_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
             packed_value_states = self.v_proj(packed_query_sequence).view(-1, self.num_key_value_heads, self.head_dim)
@@ -531,6 +533,7 @@ class PackedAttentionMoT(Qwen2Attention):
             packed_value_states[packed_text_indexes] = self.v_proj(packed_text_query_sequence)
             packed_value_states[packed_vae_token_indexes] = self.v_proj_moe_gen(packed_vae_query_sequence)
 
+            # 调整形状为 [seq_len, num_heads, head_dim]
             packed_query_states = packed_query_states.view(-1, self.num_heads, self.head_dim)
             packed_key_states = packed_key_states.view(-1, self.num_key_value_heads, self.head_dim)
             packed_value_states = packed_value_states.view(-1, self.num_key_value_heads, self.head_dim)
@@ -543,15 +546,18 @@ class PackedAttentionMoT(Qwen2Attention):
             packed_key_states[packed_text_indexes] = self.k_norm(packed_key_states[packed_text_indexes])
             packed_key_states[packed_vae_token_indexes] = self.k_norm_moe_gen(packed_key_states[packed_vae_token_indexes])
 
+        # 应用旋转位置编码
         packed_cos, packed_sin = packed_query_position_embeddings
         packed_query_states, packed_key_states = apply_rotary_pos_emb(
             packed_query_states, packed_key_states, packed_cos, packed_sin, unsqueeze_dim=1
         )
 
+        # 转换数据类型
         packed_query_states = packed_query_states.to(torch.bfloat16)
         packed_key_states = packed_key_states.to(torch.bfloat16)
         packed_value_states = packed_value_states.to(torch.bfloat16)
 
+        # 处理历史键值对
         if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
             past_key_states = past_key_values.key_cache[self.layer_idx]
             past_value_states = past_key_values.value_cache[self.layer_idx]
@@ -569,31 +575,101 @@ class PackedAttentionMoT(Qwen2Attention):
             merged_value_states = packed_value_states
             key_values_lens = query_lens
 
-        cu_seqlens_q = torch.nn.functional.pad(torch.cumsum(query_lens, dim=0), (1, 0))
-        cu_seqlens_k = torch.nn.functional.pad(torch.cumsum(key_values_lens, dim=0), (1, 0))
+        # 1. 处理GQA (Grouped Query Attention)
+        # 重复key和value的头以匹配query的头数量
+        if self.num_key_value_groups > 1:
+            # 增加批次维度以便重复
+            packed_query_states = packed_query_states.unsqueeze(0)  # [1, seq_len, num_heads, head_dim]
+            
+            # 对key和value进行重复以匹配query的头数量
+            merged_key_states = repeat_kv(merged_key_states.unsqueeze(0), self.num_key_value_groups)  # [1, seq_len, num_heads, head_dim]
+            merged_value_states = repeat_kv(merged_value_states.unsqueeze(0), self.num_key_value_groups)  # [1, seq_len, num_heads, head_dim]
+        else:
+            # 增加批次维度
+            packed_query_states = packed_query_states.unsqueeze(0)
+            merged_key_states = merged_key_states.unsqueeze(0)
+            merged_value_states = merged_value_states.unsqueeze(0)
 
-        packed_attn_output = flash_attn_varlen_func(
-            q=packed_query_states,
-            k=merged_key_states,
-            v=merged_value_states,
-            cu_seqlens_q=cu_seqlens_q.to(torch.int32),
-            cu_seqlens_k=cu_seqlens_k.to(torch.int32),
-            max_seqlen_q=max(query_lens).item(),
-            max_seqlen_k=max(key_values_lens).item(),
-            causal=is_causal,
-        )
-        packed_attn_output = packed_attn_output.reshape(-1, self.hidden_size)
+        # 2. 解包并填充张量
+        from torch.nn.utils.rnn import pad_sequence
+
+        # 将打包的张量分割成一个列表，每个元素是一个序列
+        query_list = torch.split(packed_query_states[0], query_lens.tolist(), dim=0)  # 移除批次维度后分割
+        key_list = torch.split(merged_key_states[0], key_values_lens.tolist(), dim=0)
+        value_list = torch.split(merged_value_states[0], key_values_lens.tolist(), dim=0)
+
+        # 将列表中的序列进行填充，使它们具有相同的最大长度
+        # 填充后形状: [batch_size, max_seq_len, num_heads, head_dim]
+        padded_query = pad_sequence(query_list, batch_first=True)
+        padded_key = pad_sequence(key_list, batch_first=True)
+        padded_value = pad_sequence(value_list, batch_first=True)
+
+        # 3. 调整维度顺序为SDPA所需的 [batch_size, num_heads, seq_len, head_dim]
+        padded_query = padded_query.transpose(1, 2)  # [batch, num_heads, seq_len_q, head_dim]
+        padded_key = padded_key.transpose(1, 2)      # [batch, num_heads, seq_len_k, head_dim]
+        padded_value = padded_value.transpose(1, 2)  # [batch, num_heads, seq_len_k, head_dim]
+
+        # 4. 创建注意力掩码
+        # 掩码形状需要是 [batch_size, 1, seq_len_q, seq_len_k] 以匹配SDPA要求
+        mask_list = [torch.ones(l, dtype=torch.bool, device=padded_key.device) for l in key_values_lens]
+        padding_mask = pad_sequence(mask_list, batch_first=True, padding_value=False)  # [batch, seq_len_k]
+        
+        # 扩展掩码维度以匹配注意力计算
+        attn_mask = ~padding_mask.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, seq_len_k]
+        
+        # 如果查询和键的长度不同，需要调整掩码
+        if padded_query.shape[2] != padded_key.shape[2]:
+            # 创建新的掩码并复制值
+            batch_size, _, seq_len_q, _ = padded_query.shape
+            _, _, seq_len_k, _ = padded_key.shape
+            new_mask = torch.zeros(batch_size, 1, seq_len_q, seq_len_k, dtype=torch.bool, device=padding_mask.device)
+            new_mask[:, :, :, :padding_mask.shape[1]] = attn_mask
+            attn_mask = new_mask
+
+        # 5. 调用SDPA函数
+        if is_causal:
+            # 因果模式下，SDPA会自动处理因果掩码
+            padded_attn_output = torch.nn.functional.scaled_dot_product_attention(
+                padded_query,
+                padded_key,
+                padded_value,
+                attn_mask=attn_mask,
+                is_causal=True,
+            )
+        else:
+            padded_attn_output = torch.nn.functional.scaled_dot_product_attention(
+                padded_query,
+                padded_key,
+                padded_value,
+                attn_mask=attn_mask,
+                is_causal=False,
+            )
+
+        # 6. 调整输出维度顺序并重新打包
+        padded_attn_output = padded_attn_output.transpose(1, 2)  # [batch, seq_len_q, num_heads, head_dim]
+        
+        # 重新打包输出张量
+        attn_output_list = [padded_attn_output[i, :query_lens[i]] for i in range(len(query_lens))]
+        packed_attn_output = torch.cat(attn_output_list, dim=0)  # [total_seq_len, num_heads, head_dim]
+        
+        # 重塑为 [total_seq_len, hidden_size]
+        packed_attn_output = packed_attn_output.reshape(-1, self.num_heads * self.head_dim)
+        
+        # 应用输出投影
         if mode == 'und':
             packed_attn_output = self.o_proj(packed_attn_output)
         elif mode == 'gen':
             packed_attn_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
             packed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
 
-        if update_past_key_values:
-            past_key_values.key_cache[self.layer_idx] = merged_key_states
-            past_key_values.value_cache[self.layer_idx] = merged_value_states
+        # 更新历史键值对
+        if update_past_key_values and past_key_values is not None:
+            # 移除批次维度后保存
+            past_key_values.key_cache[self.layer_idx] = merged_key_states[0]
+            past_key_values.value_cache[self.layer_idx] = merged_value_states[0]
 
         return packed_attn_output, past_key_values
+
     
     
 if __name__ == "__main__":
