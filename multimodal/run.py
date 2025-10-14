@@ -1,3 +1,129 @@
+def verify_custom_kernel_vs_pytorch():
+    import custom_attention
+    print("\n=== Custom Kernel vs PyTorch算子顺序实现 验证 ===")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float32
+    # 可通过环境变量覆盖初始规模
+    def _get_env_int(name, default):
+        try:
+            return int(os.getenv(name, default))
+        except Exception:
+            return default
+    # 默认使用区间内的随机值，使每次运行的数据集大小不一致且更均匀；如设置了环境变量则优先生效
+    batch_size = _get_env_int('ATTN_B', random.randint(1, 4))
+    num_heads = _get_env_int('ATTN_H', random.randint(4, 32))
+    seq_len = _get_env_int('ATTN_S', random.randint(256, 8192))
+    head_dim = _get_env_int('ATTN_D', random.randint(64, 128))
+    # 基于显存预算对 seq_len 做内存安全裁剪（主要约束来自 S^2 的 scores/weights）
+    def estimate_bytes(B,H,S,D):
+        bytes_scores = B*H*S*S*4
+        bytes_weights = bytes_scores
+        bytes_qkv = 3*B*H*S*D*4
+        bytes_out = B*H*S*D*4
+        bytes_mask = S*S*1
+        return bytes_scores + bytes_weights + bytes_qkv + bytes_out + bytes_mask
+    if torch.cuda.is_available():
+        total_mem = torch.cuda.get_device_properties(0).total_memory
+    else:
+        total_mem = 8 * (1024**3)
+    budget = int(total_mem * 0.6)  # 留出空间给系统/缓存
+    while seq_len > 16 and estimate_bytes(batch_size, num_heads, seq_len, head_dim) > budget:
+        seq_len = max(16, seq_len // 2)
+    print(f"[verify] 使用尺寸: B={batch_size}, H={num_heads}, S={seq_len}, D={head_dim} (预算≈{budget/1024/1024/1024:.1f} GB)")
+    q = torch.rand(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
+    k = torch.rand(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
+    v = torch.rand(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
+    # causal mask: True=mask
+    mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
+    print(f"Tensor shapes: q {q.shape}, k {k.shape}, v {v.shape}, mask {mask.shape}")
+    # Custom kernel output
+    out_custom = custom_attention.forward(q, k, v, mask)
+    # PyTorch reference（先做一次正确性验证，不计时）
+    scale = 1.0 / (head_dim ** 0.5)
+    attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    attn_scores = attn_scores.masked_fill(mask, float('-inf'))
+    # 正确性验证
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    attn_weights_once = torch.softmax(attn_scores, dim=-1)
+    out_ref_once = torch.matmul(attn_weights_once, v)
+    abs_diff_once = (out_custom - out_ref_once).abs()
+    rel_diff_once = abs_diff_once / (out_ref_once.abs() + 1e-8)
+    max_abs_once = abs_diff_once.max().item()
+    mean_abs_once = abs_diff_once.mean().item()
+    max_rel_once = rel_diff_once.max().item()
+    allclose_once = torch.allclose(out_custom, out_ref_once, atol=1e-4, rtol=1e-4)
+    print(f"正确性: max_abs={max_abs_once:.6e}, mean_abs={mean_abs_once:.6e}, max_rel={max_rel_once:.6e}, allclose={allclose_once}")
+    if allclose_once:
+        print("✅ SUCCESS: The outputs of the custom operator and PyTorch are consistent!")
+    else:
+        print("❌ FAILURE: The outputs do not match.")
+        print(f"   Max absolute difference: {max_abs_once:.6e}")
+        print("   Possible causes:")
+        print("   - Mask dtype/semantics mismatch: use boolean mask where True=masked，apply -inf before softmax")
+        print("   - Scaling mismatch: ensure logits scaled by 1/sqrt(D)")
+        print("   - Softmax stability: subtract row-wise max before exp/softmax")
+        print("   - Dtype issues: compute QK^T/softmax/weights@V in float32")
+        print("   - Broadcasting/shape: verify mask is [S,S] and broadcasted correctly across [B,H]")
+    # 计时 softmax：改为每次迭代随机生成不同数据集大小，并对各自 softmax 计时后再求平均
+    import time
+    times = []
+    shapes = []
+    N = int(os.getenv('ATTN_N', '10'))
+    print(f"\n--- Variable-size Softmax timing across {N} randomly sampled shapes ---")
+    for i in range(N):
+        # 为本次计时随机采样一个新形状，并做内存裁剪
+        bs_i = _get_env_int('ATTN_B', random.randint(1, 4))
+        nh_i = _get_env_int('ATTN_H', random.randint(4, 32))
+        sl_i = _get_env_int('ATTN_S', random.randint(256, 8192))
+        hd_i = _get_env_int('ATTN_D', random.randint(64, 128))
+        while sl_i > 16 and estimate_bytes(bs_i, nh_i, sl_i, hd_i) > budget:
+            sl_i = max(16, sl_i // 2)
+
+        # 构造张量并计算 attn_scores（仅用于 softmax 计时）
+        q_i = torch.rand(bs_i, nh_i, sl_i, hd_i, device=device, dtype=dtype)
+        k_i = torch.rand(bs_i, nh_i, sl_i, hd_i, device=device, dtype=dtype)
+        mask_i = torch.triu(torch.ones(sl_i, sl_i, device=device, dtype=torch.bool), diagonal=1)
+        scale_i = 1.0 / (hd_i ** 0.5)
+        scores_i = torch.matmul(q_i, k_i.transpose(-2, -1)) * scale_i
+        scores_i = scores_i.masked_fill(mask_i, float('-inf'))
+
+        # 每个形状做一次短 warmup，避免首次开销影响
+        _ = torch.softmax(scores_i, dim=-1)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        # 正式计时
+        t0 = time.perf_counter()
+        _ = torch.softmax(scores_i, dim=-1)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        elapsed = (t1 - t0) * 1000
+        times.append(elapsed)
+        shapes.append((bs_i, nh_i, sl_i, hd_i))
+        print(f"#{i+1}: B={bs_i}, H={nh_i}, S={sl_i}, D={hd_i} -> Softmax: {elapsed:.4f} ms")
+
+    # 剔除最大/最小后求平均
+    times_sorted = sorted(times)
+    if N > 2:
+        trimmed = times_sorted[1:-1]
+    else:
+        trimmed = times_sorted
+    avg = sum(trimmed) / len(trimmed)
+    print(f"Variable-size Softmax去除极值后平均耗时: {avg:.4f} ms")
+
+    # 首个样本的详细对比打印（避免与不同形状的计时变量混淆）
+    abs_diff = abs_diff_once
+    out_ref = out_ref_once
+    # 输出前2个batch、前2个head、前2个seq、前8个特征（基于首个样本）
+    for b in range(min(2, out_custom.shape[0])):
+        for h in range(min(2, out_custom.shape[1])):
+            for s in range(min(2, out_custom.shape[2])):
+                print(f"[b={b},h={h},s={s}] custom:   ", out_custom[b,h,s,:8].cpu().numpy())
+                print(f"[b={b},h={h},s={s}] pytorch:  ", out_ref[b,h,s,:8].cpu().numpy())
+                print(f"[b={b},h={h},s={s}] abs_diff: ", abs_diff[b,h,s,:8].cpu().numpy())
+
 # Copyright 2025 Bytedance Ltd. and/or its affiliates. 
 # SPDX-License-Identifier: Apache-2.0 
 
@@ -8,6 +134,7 @@ import os
 import random 
 from typing import List, Tuple 
 import time 
+import torch.nn.functional as F
 
 # Ensure the bagel_mot_attention.py file is in the same directory
 try: 
@@ -16,36 +143,23 @@ except ImportError:
     print("Error: Please ensure bagel_mot_attention.py is in the same directory as this script.") 
     exit() 
 
-def create_structured_attention_mask( 
-    samples_config: List[Tuple[str, int]],  
-    device: str,  
-    dtype: torch.dtype 
-) -> List[torch.Tensor]: 
+def create_structured_attention_mask(
+    samples_config: List[Tuple[str, int]],
+    device: str,
+    dtype: torch.dtype,
+) -> List[torch.Tensor]:
 
-    total_length = sum(length for _, length in samples_config) 
-    
-    attention_mask_tensor = torch.full( 
-        (total_length, total_length),  
-        -float('inf'),  
-        device=device,  
-        dtype=dtype 
-    ) 
-
-    current_offset = 0 
-    for sample_type, sample_length in samples_config: 
-        s = slice(current_offset, current_offset + sample_length) 
-        
-        if sample_type == 'text': 
-            causal_mask = torch.tril( 
-                torch.ones((sample_length, sample_length), device=device, dtype=torch.bool) 
-            ) 
-            attention_mask_tensor[s, s] = torch.where(causal_mask, 0.0, -float('inf')) 
-        else: # image or noise 
-            attention_mask_tensor[s, s] = 0.0 
-        
-        current_offset += sample_length 
-
-    return [attention_mask_tensor] 
+    # sdpa per-sample policy: return a list of boolean masks, each [Li, Li]
+    # True indicates masked (disallow), False indicates allowed.
+    masks: List[torch.Tensor] = []
+    for sample_type, sample_length in samples_config:
+        if sample_type == 'text':
+            causal_allowed = torch.tril(torch.ones((sample_length, sample_length), device=device, dtype=torch.bool))
+            mask_bool = ~causal_allowed
+        else:
+            mask_bool = torch.zeros((sample_length, sample_length), device=device, dtype=torch.bool)
+        masks.append(mask_bool)
+    return masks
 
 def run_train_test_with_profiler(use_custom_kernel: float = False):  
     
@@ -70,6 +184,7 @@ def run_train_test_with_profiler(use_custom_kernel: float = False):
     if not torch.cuda.is_available(): 
         print("Warning: CUDA device not detected. The program will run on the CPU, which may be slow.") 
 
+    force_math_reference_env = bool(int(os.getenv("FORCE_MATH_REF", "0")))
     attention_layer = PackedAttentionMoT( 
         hidden_size=hidden_size, 
         num_attention_heads=num_attention_heads, 
@@ -82,7 +197,8 @@ def run_train_test_with_profiler(use_custom_kernel: float = False):
         rms_norm_eps=rms_norm_eps, 
         freeze_und=False, 
         layer_idx=0, 
-        use_custom_kernel=use_custom_kernel 
+        use_custom_kernel=use_custom_kernel, 
+        force_math_reference=force_math_reference_env and (not use_custom_kernel),
     ).to(device=device, dtype=dtype).train() 
 
     rotary_emb = Qwen2RotaryEmbedding( 
@@ -209,6 +325,287 @@ def run_train_test_with_profiler(use_custom_kernel: float = False):
             print(f"  Parameter: {k:<28} | Type: {type(v)}") 
     print("="*50 + "\n") 
 
+    # ============================================================================== 
+    # 6-Pre: Numerical correctness check (custom kernel vs step-by-step reference)
+    # ============================================================================== 
+    try:
+        print("--- Running numerical correctness check (custom kernel vs step-by-step reference) ---")
+
+        # Build a custom kernel module and align weights for fair comparison
+        att_custom = PackedAttentionMoT(
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            max_position_embeddings=max_position_embeddings,
+            rope_theta=rope_theta,
+            is_causal=False,
+            attention_dropout=0.0,
+            qk_norm=True,
+            rms_norm_eps=rms_norm_eps,
+            freeze_und=False,
+            layer_idx=0,
+            use_custom_kernel=True,
+            force_math_reference=False,
+        ).to(device=device, dtype=dtype).eval()
+
+        # For reference: step-by-step FP32 implementation for the entire packed sequence
+        with torch.no_grad():
+            # 1. Rebuild q/k/v after norm + RoPE in float32 (packed)
+            pq = torch.zeros(sequence_length, att_custom.num_heads * (hidden_size // att_custom.num_heads), device=device, dtype=dtype)
+            pk = torch.zeros(sequence_length, att_custom.num_key_value_heads * (hidden_size // att_custom.num_key_value_heads), device=device, dtype=dtype)
+            pv = torch.zeros_like(pk)
+
+            packed_sequence_und = packed_sequence[packed_und_token_indexes]
+            packed_sequence_gen = packed_sequence[packed_gen_token_indexes]
+            pq[packed_und_token_indexes] = att_custom.q_proj(packed_sequence_und)
+            pq[packed_gen_token_indexes] = att_custom.q_proj_moe_gen(packed_sequence_gen)
+            pk[packed_und_token_indexes] = att_custom.k_proj(packed_sequence_und)
+            pk[packed_gen_token_indexes] = att_custom.k_proj_moe_gen(packed_sequence_gen)
+            pv[packed_und_token_indexes] = att_custom.v_proj(packed_sequence_und)
+            pv[packed_gen_token_indexes] = att_custom.v_proj_moe_gen(packed_sequence_gen)
+
+            H = att_custom.num_heads
+            D = hidden_size // H
+            pq = pq.view(-1, H, D)
+            pk = pk.view(-1, att_custom.num_key_value_heads, D)
+            pv = pv.view(-1, att_custom.num_key_value_heads, D)
+
+            # q/k norms
+            pq_ = torch.zeros_like(pq)
+            pk_ = torch.zeros_like(pk)
+            pq_[packed_und_token_indexes] = att_custom.q_norm(pq[packed_und_token_indexes])
+            pq_[packed_gen_token_indexes] = att_custom.q_norm_moe_gen(pq[packed_gen_token_indexes])
+            pk_[packed_und_token_indexes] = att_custom.k_norm(pk[packed_und_token_indexes])
+            pk_[packed_gen_token_indexes] = att_custom.k_norm_moe_gen(pk[packed_gen_token_indexes])
+
+            # RoPE in float32
+            cos, sin = packed_position_embeddings
+            pq_, pk_ = pq_.to(torch.float32), pk_.to(torch.float32)
+            pq_, pk_ = (pq_ * cos.unsqueeze(1)) + (torch.cat((-pq_[..., D//2:], pq_[..., :D//2]), dim=-1) * sin.unsqueeze(1)), \
+                       (pk_ * cos.unsqueeze(1)) + (torch.cat((-pk_[..., D//2:], pk_[..., :D//2]), dim=-1) * sin.unsqueeze(1))
+
+            # GQA expand K/V to H
+            def _repeat_kv(x_1s_kv_d: torch.Tensor, n_rep: int) -> torch.Tensor:
+                if n_rep == 1:
+                    return x_1s_kv_d
+                b, s, kv, d = x_1s_kv_d.shape
+                x = x_1s_kv_d.unsqueeze(3).expand(b, s, kv, n_rep, d)
+                return x.reshape(b, s, kv * n_rep, d)
+            k_gqa = _repeat_kv(pk_.unsqueeze(0), att_custom.num_key_value_groups).squeeze(0)  # [S,H,D]
+            v_gqa = _repeat_kv(pv.to(torch.float32).unsqueeze(0), att_custom.num_key_value_groups).squeeze(0)
+
+            # Split per-sample: get chunks [H, Li, D]
+            q_chunks = pq_.transpose(0, 1).split(sample_lens, dim=1)
+            k_chunks = k_gqa.transpose(0, 1).split(sample_lens, dim=1)
+            v_chunks = v_gqa.transpose(0, 1).split(sample_lens, dim=1)
+            mask_chunks = [m.to(torch.bool) for m in attention_mask]
+
+            # Compute reference output for all samples/heads
+            ref_outputs = []
+            for q_hld, k_hld, v_hld, mask_bool in zip(q_chunks, k_chunks, v_chunks, mask_chunks):
+                # q_hld, k_hld, v_hld: [H, L, D], mask_bool: [L, L]
+                H, L, D = q_hld.shape
+                out = torch.zeros(H, L, D, device=q_hld.device, dtype=torch.float32)
+                for h in range(H):
+                    q = q_hld[h]  # [L, D]
+                    k = k_hld[h]
+                    v = v_hld[h]
+                    logits = (q @ k.transpose(0, 1)) / (D ** 0.5)
+                    logits = logits.masked_fill(mask_bool, -float('inf'))
+                    logits = logits - torch.amax(logits, dim=-1, keepdim=True)
+                    weights = torch.softmax(logits, dim=-1)
+                    out[h] = weights @ v
+                ref_outputs.append(out.transpose(0, 1).contiguous())  # [L, H, D]
+            ref_packed = torch.cat(ref_outputs, dim=0).reshape(-1, H * D)
+
+            # Apply the same output projection as forward_train for fair comparison
+            ref_after_proj = torch.zeros_like(ref_packed)
+            if packed_und_token_indexes.numel() > 0:
+                ref_after_proj[packed_und_token_indexes] = att_custom.o_proj(
+                    ref_packed[packed_und_token_indexes].to(att_custom.o_proj.weight.dtype)
+                ).to(ref_after_proj.dtype)
+            if packed_gen_token_indexes.numel() > 0:
+                ref_after_proj[packed_gen_token_indexes] = att_custom.o_proj_moe_gen(
+                    ref_packed[packed_gen_token_indexes].to(att_custom.o_proj_moe_gen.weight.dtype)
+                ).to(ref_after_proj.dtype)
+
+            # Custom kernel output
+            out_custom = att_custom.forward_train(**inputs)
+
+        # Compare in float32 for stable metrics
+        a = ref_after_proj.to(torch.float32)
+        b = out_custom.to(torch.float32)
+        diff = (a - b).abs()
+        max_abs = diff.max().item()
+        mean_abs = diff.mean().item()
+        denom = a.abs().max().item() + 1e-8
+        rel_max = max_abs / denom
+
+        # dtype-aware tolerances
+        if dtype in (torch.bfloat16, torch.float16):
+            atol, rtol = 1e-2, 1e-2
+        else:
+            atol, rtol = 1e-4, 1e-4
+
+        passed = max_abs <= max(atol, rtol * denom)
+        print(f"Numeric check results: max_abs_diff={max_abs:.6e}, mean_abs_diff={mean_abs:.6e}, rel_max={rel_max:.6e}")
+        print(f"Using tolerances: atol={atol}, rtol={rtol}")
+        if passed:
+            print("✅ Custom kernel numerical check PASSED vs reference implementation.")
+        else:
+            print("❌ Custom kernel numerical check FAILED vs reference implementation.")
+
+        # Optionally save diagnostics
+        try:
+            os.makedirs('./logs', exist_ok=True)
+            torch.save({
+                'dtype': str(dtype),
+                'samples_config': samples_config,
+                'max_abs_diff': max_abs,
+                'mean_abs_diff': mean_abs,
+                'rel_max': rel_max,
+                'atol': atol,
+                'rtol': rtol,
+                'ref_sample': a[: min(4, a.shape[0])].cpu(),
+                'out_custom_sample': b[: min(4, b.shape[0])].cpu(),
+                'diff_sample': diff[: min(4, diff.shape[0])].cpu(),
+            }, './logs/numeric_check_diffs.pt')
+            print("Saved numeric check diagnostics to ./logs/numeric_check_diffs.pt")
+        except Exception as _:
+            print("(Skip saving diagnostics)")
+        try:
+            print("--- Step-by-step debug on one sample/head (float32, mask as bool) ---")
+
+            # Helper: repeat_kv for GQA (for debug only)
+            def _repeat_kv(x_1s_kv_d: torch.Tensor, n_rep: int) -> torch.Tensor:
+                # x: [1, S, Kv, D] -> [1, S, H, D]
+                if n_rep == 1:
+                    return x_1s_kv_d
+                b, s, kv, d = x_1s_kv_d.shape
+                x = x_1s_kv_d.unsqueeze(3).expand(b, s, kv, n_rep, d)  # [1,S,Kv,rep,D]
+                return x.reshape(b, s, kv * n_rep, d)
+
+            # 1) Rebuild q/k/v after norm + RoPE in float32 (packed) using module weights
+            with torch.no_grad():
+                att = att_custom  # reuse the same module to avoid undefined variable and ensure weight parity
+                # projections (packed)
+                pq = torch.zeros(sequence_length, att.num_heads * (hidden_size // att.num_heads), device=device, dtype=dtype)
+                pk = torch.zeros(sequence_length, att.num_key_value_heads * (hidden_size // att.num_heads), device=device, dtype=dtype)
+                pv = torch.zeros_like(pk)
+
+                packed_sequence_und = packed_sequence[packed_und_token_indexes]
+                packed_sequence_gen = packed_sequence[packed_gen_token_indexes]
+                pq[packed_und_token_indexes] = att.q_proj(packed_sequence_und)
+                pq[packed_gen_token_indexes] = att.q_proj_moe_gen(packed_sequence_gen)
+                pk[packed_und_token_indexes] = att.k_proj(packed_sequence_und)
+                pk[packed_gen_token_indexes] = att.k_proj_moe_gen(packed_sequence_gen)
+                pv[packed_und_token_indexes] = att.v_proj(packed_sequence_und)
+                pv[packed_gen_token_indexes] = att.v_proj_moe_gen(packed_sequence_gen)
+
+                H = att.num_heads
+                D = hidden_size // H
+                pq = pq.view(-1, H, D)
+                pk = pk.view(-1, att.num_key_value_heads, D)
+                pv = pv.view(-1, att.num_key_value_heads, D)
+
+                # q/k norms
+                pq_ = torch.zeros_like(pq)
+                pk_ = torch.zeros_like(pk)
+                pq_[packed_und_token_indexes] = att.q_norm(pq[packed_und_token_indexes])
+                pq_[packed_gen_token_indexes] = att.q_norm_moe_gen(pq[packed_gen_token_indexes])
+                pk_[packed_und_token_indexes] = att.k_norm(pk[packed_und_token_indexes])
+                pk_[packed_gen_token_indexes] = att.k_norm_moe_gen(pk[packed_gen_token_indexes])
+
+                # RoPE
+                cos, sin = packed_position_embeddings
+                pq_, pk_ = pq_.to(torch.float32), pk_.to(torch.float32)
+                pq_, pk_ = (pq_ * cos.unsqueeze(1)) + (torch.cat((-pq_[..., D//2:], pq_[..., :D//2]), dim=-1) * sin.unsqueeze(1)), \
+                           (pk_ * cos.unsqueeze(1)) + (torch.cat((-pk_[..., D//2:], pk_[..., :D//2]), dim=-1) * sin.unsqueeze(1))
+
+                # GQA expand K/V to H
+                k_gqa = _repeat_kv(pk_.unsqueeze(0), att.num_key_value_groups).squeeze(0)  # [S,H,D]
+                v_gqa = _repeat_kv(pv.to(torch.float32).unsqueeze(0), att.num_key_value_groups).squeeze(0)
+
+                # Split per-sample: get chunks [H, Li, D]
+                q_chunks = pq_.transpose(0, 1).split(sample_lens, dim=1)
+                k_chunks = k_gqa.transpose(0, 1).split(sample_lens, dim=1)
+                v_chunks = v_gqa.transpose(0, 1).split(sample_lens, dim=1)
+
+                # Pick first sample and first head (if available)
+                s_idx = 0
+                h_idx = 0
+                q_hld = q_chunks[s_idx][h_idx]  # [Li,D]
+                k_hld = k_chunks[s_idx][h_idx]
+                v_hld = v_chunks[s_idx][h_idx]
+                mask_bool = attention_mask[s_idx].to(torch.bool)
+
+                L = q_hld.shape[0]
+                scale = 1.0 / (D ** 0.5)
+
+                # Reference logits/softmax in float32
+                logits_ref = (q_hld @ k_hld.transpose(0, 1)) * scale
+                logits_ref = logits_ref.masked_fill(mask_bool, -float('inf'))
+                logits_ref = logits_ref - torch.amax(logits_ref, dim=-1, keepdim=True)
+                weights_ref = torch.softmax(logits_ref, dim=-1)
+                out_ref = weights_ref @ v_hld
+
+                # SDPA output for the same sample/head (try to force MATH backend; fallback to reference)
+                try:
+                    from torch.nn.attention import sdpa_kernel, SDPBackend
+                    with sdpa_kernel(backends=[SDPBackend.MATH]):
+                        out_sdpa = F.scaled_dot_product_attention(
+                            q_hld.unsqueeze(0).unsqueeze(0),  # [1,1,L,D]
+                            k_hld.unsqueeze(0).unsqueeze(0),
+                            v_hld.unsqueeze(0).unsqueeze(0),
+                            attn_mask=mask_bool.unsqueeze(0).unsqueeze(1),
+                            is_causal=False,
+                        ).squeeze(0).squeeze(0)
+                except Exception:
+                    out_sdpa = out_ref.clone()
+
+                # Custom kernel output for the same sample/head
+                try:
+                    import custom_attention
+                    out_custom = custom_attention.forward(
+                        q_hld.unsqueeze(0).unsqueeze(0).contiguous(),
+                        k_hld.unsqueeze(0).unsqueeze(0).contiguous(),
+                        v_hld.unsqueeze(0).unsqueeze(0).contiguous(),
+                        mask_bool.contiguous(),
+                    ).squeeze(0).squeeze(0)
+                except Exception:
+                    out_custom = torch.full_like(out_ref, float('nan'))
+
+                # Diffs
+                ref_sdpa_diff = (out_ref - out_sdpa).abs()
+                ref_custom_diff = (out_ref - out_custom).abs()
+                sdpa_custom_diff = (out_sdpa - out_custom).abs()
+
+                debug_info = {
+                    'sample_idx': s_idx,
+                    'head_idx': h_idx,
+                    'L': L,
+                    'D': D,
+                    'out_ref_sample': out_ref[: min(8, L)].cpu(),
+                    'out_sdpa_sample': out_sdpa[: min(8, L)].cpu(),
+                    'out_custom_sample': out_custom[: min(8, L)].cpu(),
+                    'ref_sdpa_max_abs': ref_sdpa_diff.max().item(),
+                    'ref_custom_max_abs': ref_custom_diff.max().item(),
+                    'sdpa_custom_max_abs': sdpa_custom_diff.max().item(),
+                }
+                torch.save(debug_info, './logs/attn_debug.pt')
+                print("Saved step-by-step debug to ./logs/attn_debug.pt")
+                print(
+                    f"Step-debug diffs: ref-vs-sdpa={debug_info['ref_sdpa_max_abs']:.6e}, "
+                    f"ref-vs-custom={debug_info['ref_custom_max_abs']:.6e}, "
+                    f"sdpa-vs-custom={debug_info['sdpa_custom_max_abs']:.6e}"
+                )
+        except Exception:
+            print("(Step-by-step debug) raised an exception (continuing). Stack trace:")
+            traceback.print_exc()
+    except Exception:
+        print("Numeric correctness check raised an exception (continuing). Stack trace:")
+        traceback.print_exc()
+
     try: 
         log_dir_train = './logs/train' 
         print(f"Profiler traces for training mode will be saved in: {log_dir_train}") 
@@ -292,6 +689,7 @@ def run_inference_test_with_profiler(use_custom_kernel: float = False):
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32 
     num_layers = 1 
 
+    force_math_reference_env = bool(int(os.getenv("FORCE_MATH_REF", "0")))
     attention_layer = PackedAttentionMoT( 
         hidden_size=hidden_size, 
         num_attention_heads=num_attention_heads, 
@@ -304,7 +702,8 @@ def run_inference_test_with_profiler(use_custom_kernel: float = False):
         rms_norm_eps=rms_norm_eps, 
         freeze_und=False, 
         layer_idx=0, 
-        use_custom_kernel=use_custom_kernel  
+        use_custom_kernel=use_custom_kernel, 
+        force_math_reference=force_math_reference_env and (not use_custom_kernel), 
     ).to(device=device, dtype=dtype).eval()  
 
     rotary_emb = Qwen2RotaryEmbedding( 
@@ -488,16 +887,5 @@ def run_inference_test_with_profiler(use_custom_kernel: float = False):
         traceback.print_exc() 
 
 
-if __name__ == "__main__": 
-    # --- Manual Switch ---
-    # Set to True -> Run and time your custom CUDA Kernel
-    # Set to False -> Run and time the native PyTorch implementation
-    USE_CUSTOM_KERNEL = True 
-
-    if USE_CUSTOM_KERNEL: 
-        print("🚀 Switch is ON. Running and timing [Custom CUDA Kernel].") 
-    else: 
-        print("🐢 Switch is OFF. Running and timing [Native PyTorch Implementation].") 
-
-    run_train_test_with_profiler(use_custom_kernel=USE_CUSTOM_KERNEL) 
-    run_inference_test_with_profiler(use_custom_kernel=USE_CUSTOM_KERNEL)
+if __name__ == "__main__":
+    verify_custom_kernel_vs_pytorch()

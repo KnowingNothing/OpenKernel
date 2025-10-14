@@ -31,8 +31,9 @@ try:
     # --- Merge the creation and usage logic of the mask here ---
 
     # Create the mask tensor
-    print("Creating a causal attention mask...")
-    mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.float), diagonal=1)
+    print("Creating a causal attention mask (boolean)...")
+    # project-wide policy: boolean mask, where True means 'to mask/block'
+    mask = torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1).to(torch.bool)
 
     # Call the custom CUDA operator (pass the mask)
     print("\n[1] Running custom CUDA operator with mask...")

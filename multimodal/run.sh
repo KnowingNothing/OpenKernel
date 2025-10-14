@@ -5,7 +5,7 @@
 #SBATCH --job-name=run_bagel
 #SBATCH --output=./logs/run_bagel_%j.out
 #SBATCH --error=./logs/run_bagel_%j.err
-#SBATCH --gpus=1
+#SBATCH --gres=gpu:4090:1
 #SBATCH --time=00:30:00
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=4

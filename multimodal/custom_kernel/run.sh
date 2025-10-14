@@ -2,7 +2,7 @@
 #SBATCH --job-name=compile_custom_op
 #SBATCH --output=./logs/compile_custom_op_%j.out
 #SBATCH --error=./logs/compile_custom_op_%j.err
-#SBATCH --partition=gpu
+#SBATCH --gres=gpu:4090:1
 #SBATCH --time=00:30:00
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=6
@@ -16,7 +16,7 @@ echo "================================================================"
 
 echo "Loading CUDA module..."
 module load cuda/12.4
-
+# spack load cuda@12.4.1 
 echo "Activating Conda environment: bagel..."
 # Activate conda
 CONDA_BASE=$(conda info --base)
@@ -103,6 +103,7 @@ except Exception as e:
 "
 cd custom_kernel
 
+python verify.py
 echo "================================================================"
 echo "Job End Time: $(date)"
 echo "================================================================"

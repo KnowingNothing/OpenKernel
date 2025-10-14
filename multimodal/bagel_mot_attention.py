@@ -326,7 +326,8 @@ class PackedAttentionMoT(Qwen2Attention):
         rms_norm_eps,
         freeze_und: bool,
         layer_idx,
-        use_custom_kernel: bool = False # judge which kernel to use
+        use_custom_kernel: bool = False, # judge which kernel to use
+        force_math_reference: bool = False, # if True, use simple matmul+softmax path for native
     ):
         super().__init__(
             hidden_size,
@@ -358,6 +359,7 @@ class PackedAttentionMoT(Qwen2Attention):
         if use_custom_kernel and not IS_CUSTOM_ATTENTION_AVAILABLE:
             raise ImportError("`use_custom_kernel=True` but the 'custom_attention' package could not be imported.")
         self.use_custom_kernel = use_custom_kernel
+        self.force_math_reference = force_math_reference
 
     # @timeit
     def forward_train(
@@ -405,86 +407,107 @@ class PackedAttentionMoT(Qwen2Attention):
         packed_key_states_[packed_gen_token_indexes] = self.k_norm_moe_gen(packed_key_states[packed_gen_token_indexes])
 
         packed_cos, packed_sin = packed_position_embeddings
+        # Compute RoPE in float32 to align numerics with reference implementation
+        orig_dtype = packed_query_states_.dtype
+        q32 = packed_query_states_.to(torch.float32)
+        k32 = packed_key_states_.to(torch.float32)
         packed_query_states_, packed_key_states_ = apply_rotary_pos_emb(
-            packed_query_states_, packed_key_states_, packed_cos, packed_sin, unsqueeze_dim=1
+            q32, k32, packed_cos.to(torch.float32), packed_sin.to(torch.float32), unsqueeze_dim=1
         )
 
+        # Keep original dtype for projections later; attention will run in float32
+
         if self.use_custom_kernel:
-            # --- Path A: Call our own CUDA Kernel ---
+            # --- Path A: Custom CUDA Kernel (per-sample to match sdpa semantics) ---
             print("(Using a custom CUDA Kernel...)")
 
-            # [Important Fix]: Handle GQA before reshaping
-            # Repeat the heads of K and V to match the number of heads in Q
-            # The shape of packed_..._ is (TotalSeqLen, NumKeyValueHeads, HeadDim)
-            # First, we add a batch dimension
-            k_gqa = packed_key_states_.unsqueeze(0)
-            v_gqa = packed_value_states.unsqueeze(0)
-            
-            # Call repeat_kv for replication
-            k_gqa = repeat_kv(k_gqa, self.num_key_value_groups)
-            v_gqa = repeat_kv(v_gqa, self.num_key_value_groups)
+            # Expand K/V heads to match Q (GQA) before per-sample split
+            k_gqa = packed_key_states_.unsqueeze(0)   # [1, S, Kv, D]
+            v_gqa = packed_value_states.unsqueeze(0)  # [1, S, Kv, D]
+            k_gqa = repeat_kv(k_gqa, self.num_key_value_groups)  # [1, S, H, D]
+            v_gqa = repeat_kv(v_gqa, self.num_key_value_groups)  # [1, S, H, D]
+            k_repeated = k_gqa.squeeze(0)  # [S, H, D]
+            v_repeated = v_gqa.squeeze(0)  # [S, H, D]
 
-            # Remove the batch dimension to restore the packed shape
-            k_repeated = k_gqa.squeeze(0)
-            v_repeated = v_gqa.squeeze(0)
-            
-            # Prepare inputs: Our custom kernel expects the shape (B, H, S, D)
-            # Use the GQA-processed k_repeated and v_repeated
-            q = packed_query_states_.permute(1, 0, 2).unsqueeze(0)
-            k = k_repeated.permute(1, 0, 2).unsqueeze(0)
-            v = v_repeated.permute(1, 0, 2).unsqueeze(0)
+            # Split per sample
+            q_chunks = packed_query_states_.transpose(0, 1).split(sample_lens, dim=1)  # tuple of [H, Li, D]
+            k_chunks = k_repeated.transpose(0, 1).split(sample_lens, dim=1)           # tuple of [H, Li, D]
+            v_chunks = v_repeated.transpose(0, 1).split(sample_lens, dim=1)           # tuple of [H, Li, D]
 
-            # Adapt the Mask
-            mask = attention_mask[0] if isinstance(attention_mask, List) else attention_mask
+            outputs = []
+            for q_hld, k_hld, v_hld, mask_per_sample in zip(q_chunks, k_chunks, v_chunks, attention_mask):
+                # reshape to (B=1, H, S, D) and ensure contiguous + dtype
+                q_bhsd = q_hld.to(torch.float32).contiguous().unsqueeze(0)
+                k_bhsd = k_hld.to(torch.float32).contiguous().unsqueeze(0)
+                v_bhsd = v_hld.to(torch.float32).contiguous().unsqueeze(0)
+                mask_bool = mask_per_sample.to(torch.bool).contiguous()
 
-            attn_output_custom = custom_attention.forward(q, k, v, mask)
+                out = custom_attention.forward(q_bhsd, k_bhsd, v_bhsd, mask_bool)
+                # back to [S, H, D]
+                outputs.append(out.squeeze(0).transpose(0, 1).contiguous())
 
-            # Reshape to match the subsequent code
-            packed_attn_output = attn_output_custom.squeeze(0).permute(1, 0, 2)
+            # cat along sequence
+            packed_attn_output = torch.cat(outputs, dim=0)
+            # Cast back to original dtype for downstream projections
+            packed_attn_output = packed_attn_output.to(orig_dtype)
             
         else:
             # --- Path B: Use the original PyTorch implementation (unchanged) ---
             print("   (Using native PyTorch Attention...)")
 
-            if isinstance(attention_mask, List):
-                # help understand the else branch
-                packed_key_states_ = packed_key_states_[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
-                packed_key_states_ = packed_key_states_.reshape(-1, self.num_heads, self.head_dim)
-                packed_value_states = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
-                packed_value_states = packed_value_states.reshape(-1, self.num_heads, self.head_dim)
+            # if isinstance(attention_mask, List):
+            # help understand the else branch
+            packed_key_states_ = packed_key_states_[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+            packed_key_states_ = packed_key_states_.reshape(-1, self.num_heads, self.head_dim)
+            packed_value_states = packed_value_states[:, :, None, :].repeat(1, 1, self.num_key_value_groups, 1)
+            packed_value_states = packed_value_states.reshape(-1, self.num_heads, self.head_dim)
 
-                unpacked_query_states = packed_query_states_.transpose(0, 1).split(sample_lens, dim=1)
-                unpacked_key_states = packed_key_states_.transpose(0, 1).split(sample_lens, dim=1)
-                unpacked_value_states = packed_value_states.transpose(0, 1).split(sample_lens, dim=1)
-                upacked_attn_output = []
-                for query_states, key_states, value_states, attention_mask_per_sample in zip(
-                    unpacked_query_states, unpacked_key_states, unpacked_value_states, attention_mask
-                ):
-                    with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
-                        # Attention mechanism call part
+            unpacked_query_states = packed_query_states_.transpose(0, 1).split(sample_lens, dim=1)
+            unpacked_key_states = packed_key_states_.transpose(0, 1).split(sample_lens, dim=1)
+            unpacked_value_states = packed_value_states.transpose(0, 1).split(sample_lens, dim=1)
+            upacked_attn_output = []
+            for query_states, key_states, value_states, attention_mask_per_sample in zip(
+                unpacked_query_states, unpacked_key_states, unpacked_value_states, attention_mask
+            ):
+                attn_mask_bool = attention_mask_per_sample.to(torch.bool)
+                if self.force_math_reference:
+                    # Simple reference: FP32 matmul + mask + stable softmax
+                    q = query_states.to(torch.float32).unsqueeze(0)  # [1,H,L,D]
+                    k = key_states.to(torch.float32).unsqueeze(0)    # [1,H,L,D]
+                    v = value_states.to(torch.float32).unsqueeze(0)  # [1,H,L,D]
+                    scale = 1.0 / math.sqrt(self.head_dim)
+                    logits = torch.matmul(q, k.transpose(-1, -2)) * scale  # [1,H,L,L]
+                    logits = logits.masked_fill(attn_mask_bool.unsqueeze(0).unsqueeze(1), float('-inf'))
+                    logits = logits - torch.amax(logits, dim=-1, keepdim=True)
+                    weights = torch.softmax(logits, dim=-1)
+                    attn_output = torch.matmul(weights, v)  # [1,H,L,D]
+                else:
+                    # IMPORTANT: Use MATH backend to guarantee full boolean attn_mask semantics
+                    with sdpa_kernel(backends=[SDPBackend.MATH]):
                         attn_output = scaled_dot_product_attention(
-                            query_states.to(torch.bfloat16).unsqueeze(0), 
-                            key_states.to(torch.bfloat16).unsqueeze(0), 
-                            value_states.to(torch.bfloat16).unsqueeze(0),
-                            attn_mask=attention_mask_per_sample.to(torch.bfloat16).unsqueeze(0),
+                            query_states.to(torch.float32).unsqueeze(0),
+                            key_states.to(torch.float32).unsqueeze(0),
+                            value_states.to(torch.float32).unsqueeze(0),
+                            attn_mask=attn_mask_bool.unsqueeze(0).unsqueeze(1),
+                            is_causal=False,
                         )
-                    upacked_attn_output.append(attn_output.squeeze(0))
-                packed_attn_output = torch.cat(upacked_attn_output, dim=1)
-            else:
-                pad_size = sum(sample_lens) - packed_query_states.shape[0]
-                packed_query_states_ = pad_sequence(packed_query_states_.permute(1, 0, 2), pad_size)
-                packed_key_states_ = pad_sequence(packed_key_states_.permute(1, 0, 2), pad_size)
-                packed_value_states = pad_sequence(packed_value_states.permute(1, 0, 2), pad_size)
-                # Attention mechanism call part
-                packed_attn_output = flex_attention(
-                    packed_query_states_.unsqueeze(0), # 1, num_head, L, head_dim
-                    packed_key_states_.unsqueeze(0), 
-                    packed_value_states.unsqueeze(0), 
-                    enable_gqa=True,
-                    block_mask=attention_mask,
-                )
-                end_index = packed_attn_output.shape[2] - pad_size
-                packed_attn_output = packed_attn_output[0, :, :end_index, :]
+                upacked_attn_output.append(attn_output.squeeze(0).to(orig_dtype))
+            packed_attn_output = torch.cat(upacked_attn_output, dim=1)
+            # else:
+            #     pad_size = sum(sample_lens) - packed_query_states.shape[0]
+            #     packed_query_states_ = pad_sequence(packed_query_states_.permute(1, 0, 2), pad_size).to(torch.float32)
+            #     packed_key_states_ = pad_sequence(packed_key_states_.permute(1, 0, 2), pad_size).to(torch.float32)
+            #     packed_value_states = pad_sequence(packed_value_states.permute(1, 0, 2), pad_size).to(torch.float32)
+            #     # Attention mechanism call part (flex_attention supports boolean block masks)
+            #     packed_attn_output = flex_attention(
+            #         packed_query_states_.unsqueeze(0), # 1, num_head, L, head_dim
+            #         packed_key_states_.unsqueeze(0), 
+            #         packed_value_states.unsqueeze(0), 
+            #         enable_gqa=True,
+            #         block_mask=attention_mask,
+            #     )
+            #     end_index = packed_attn_output.shape[2] - pad_size
+            #     packed_attn_output = packed_attn_output[0, :, :end_index, :].to(orig_dtype)
 
         packed_attn_output = packed_attn_output.transpose(0, 1).reshape(-1, self.num_heads * self.head_dim)
         packed_attn_output_ = packed_attn_output.new_zeros(packed_attn_output.shape)
@@ -548,14 +571,17 @@ class PackedAttentionMoT(Qwen2Attention):
 
         # 应用旋转位置编码
         packed_cos, packed_sin = packed_query_position_embeddings
+        # Compute RoPE in float32 to align numerics
+        packed_query_states = packed_query_states.to(torch.float32)
+        packed_key_states = packed_key_states.to(torch.float32)
         packed_query_states, packed_key_states = apply_rotary_pos_emb(
-            packed_query_states, packed_key_states, packed_cos, packed_sin, unsqueeze_dim=1
+            packed_query_states, packed_key_states, packed_cos.to(torch.float32), packed_sin.to(torch.float32), unsqueeze_dim=1
         )
 
-        # 转换数据类型
-        packed_query_states = packed_query_states.to(torch.bfloat16)
-        packed_key_states = packed_key_states.to(torch.bfloat16)
-        packed_value_states = packed_value_states.to(torch.bfloat16)
+        # 计算精度对齐：使用 float32 进行注意力计算（保持 mask 为 bool），之后再转回权重 dtype
+        packed_query_states = packed_query_states.to(torch.float32)
+        packed_key_states = packed_key_states.to(torch.float32)
+        packed_value_states = packed_value_states.to(torch.float32)
 
         # 处理历史键值对
         if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
@@ -609,26 +635,23 @@ class PackedAttentionMoT(Qwen2Attention):
         padded_key = padded_key.transpose(1, 2)      # [batch, num_heads, seq_len_k, head_dim]
         padded_value = padded_value.transpose(1, 2)  # [batch, num_heads, seq_len_k, head_dim]
 
-        # 4. 创建注意力掩码
-        # 掩码形状需要是 [batch_size, 1, seq_len_q, seq_len_k] 以匹配SDPA要求
+        # 4. 创建注意力掩码（布尔）。True 表示需要屏蔽（不允许）。
         mask_list = [torch.ones(l, dtype=torch.bool, device=padded_key.device) for l in key_values_lens]
+        # padding_mask: True 表示该位置存在（允许），False 表示填充
         padding_mask = pad_sequence(mask_list, batch_first=True, padding_value=False)  # [batch, seq_len_k]
-        
-        # 扩展掩码维度以匹配注意力计算
+        # attn_mask: True 表示屏蔽 => 这里对不存在的位置进行屏蔽
         attn_mask = ~padding_mask.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, seq_len_k]
-        
+
         # 如果查询和键的长度不同，需要调整掩码
         if padded_query.shape[2] != padded_key.shape[2]:
-            # 创建新的掩码并复制值
             batch_size, _, seq_len_q, _ = padded_query.shape
             _, _, seq_len_k, _ = padded_key.shape
             new_mask = torch.zeros(batch_size, 1, seq_len_q, seq_len_k, dtype=torch.bool, device=padding_mask.device)
             new_mask[:, :, :, :padding_mask.shape[1]] = attn_mask
             attn_mask = new_mask
 
-        # 5. 调用SDPA函数
+        # 5. 调用SDPA函数（布尔掩码）
         if is_causal:
-            # 因果模式下，SDPA会自动处理因果掩码
             padded_attn_output = torch.nn.functional.scaled_dot_product_attention(
                 padded_query,
                 padded_key,
@@ -647,14 +670,16 @@ class PackedAttentionMoT(Qwen2Attention):
 
         # 6. 调整输出维度顺序并重新打包
         padded_attn_output = padded_attn_output.transpose(1, 2)  # [batch, seq_len_q, num_heads, head_dim]
-        
+
         # 重新打包输出张量
         attn_output_list = [padded_attn_output[i, :query_lens[i]] for i in range(len(query_lens))]
         packed_attn_output = torch.cat(attn_output_list, dim=0)  # [total_seq_len, num_heads, head_dim]
-        
-        # 重塑为 [total_seq_len, hidden_size]
+
+        # 重塑为 [total_seq_len, hidden_size] 并转回权重 dtype
         packed_attn_output = packed_attn_output.reshape(-1, self.num_heads * self.head_dim)
-        
+        out_dtype = self.o_proj.weight.dtype if hasattr(self.o_proj, 'weight') else packed_query_states.dtype
+        packed_attn_output = packed_attn_output.to(out_dtype)
+
         # 应用输出投影
         if mode == 'und':
             packed_attn_output = self.o_proj(packed_attn_output)
@@ -664,7 +689,6 @@ class PackedAttentionMoT(Qwen2Attention):
 
         # 更新历史键值对
         if update_past_key_values and past_key_values is not None:
-            # 移除批次维度后保存
             past_key_values.key_cache[self.layer_idx] = merged_key_states[0]
             past_key_values.value_cache[self.layer_idx] = merged_value_states[0]
 

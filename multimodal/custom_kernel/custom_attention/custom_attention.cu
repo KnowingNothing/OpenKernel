@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 
 #define CUDA_CHECK(call) do { \
     cudaError_t err = call; \
@@ -13,7 +14,7 @@
 // Kernel 1: Scaled Dot-Product
 __global__ void scaled_dot_product_kernel_naive(
     const float* q_data, const float* k_data, 
-    const float* mask_data,     
+    const uint8_t* mask_data,     
     float* scores_data,
     int seq_len, int head_dim, float scale) 
 {
@@ -24,7 +25,7 @@ __global__ void scaled_dot_product_kernel_naive(
 
     const int mask_idx = query_idx * seq_len + key_idx;
     if (mask_data != nullptr && mask_data[mask_idx]) {
-        scores_data[mask_idx] = -1.0e9f;
+        scores_data[mask_idx] = -INFINITY;
         return;
     }
     
@@ -44,14 +45,20 @@ __global__ void softmax_kernel_naive(const float* scores_data, float* weights_da
 {
     const int row = blockIdx.x;
     const int col = threadIdx.x;
-    if (col >= seq_len) return;
     const float* row_input = scores_data + row * seq_len;
     float* row_output = weights_data + row * seq_len;
-    float max_val = -__FLT_MAX__;
-    for (int i = 0; i < seq_len; ++i) max_val = max(max_val, row_input[i]);
+    float max_val = -INFINITY;
+    for (int i = 0; i < seq_len; ++i) max_val = fmaxf(max_val, row_input[i]);
     float sum_val = 0.0f;
-    for (int i = 0; i < seq_len; ++i) sum_val += expf(row_input[i] - max_val);
-    row_output[col] = expf(row_input[col] - max_val) / sum_val;
+    for (int i = 0; i < seq_len; ++i) sum_val += __expf(row_input[i] - max_val);
+    // 写回所有列（当 seq_len > blockDim.x 时，使用步长写覆盖全部列）
+    for (int c = col; c < seq_len; c += blockDim.x) {
+        if (sum_val == 0.0f || !isfinite(sum_val)) {
+            row_output[c] = 0.0f;
+        } else {
+            row_output[c] = __expf(row_input[c] - max_val) / sum_val;
+        }
+    }
 }
 
 // Kernel 3: Matrix Multiply 
@@ -63,6 +70,7 @@ __global__ void matrix_multiply_kernel_naive(
     if (row >= M || col >= N) return;
     float sum = 0.0f;
     for (int i = 0; i < K; ++i) sum += A[row * K + i] * B[i * N + col];
+
     C[row * N + col] = sum;
 }
 
@@ -72,7 +80,7 @@ void attention_forward_cuda(
     const float* q_data,
     const float* k_data,
     const float* v_data,
-    const float* mask_data,
+    const uint8_t* mask_data,
     float* output_data,
     int batch_size,
     int num_heads,

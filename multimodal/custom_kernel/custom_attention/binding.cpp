@@ -6,7 +6,7 @@ void attention_forward_cuda(
     const float* q_data,
     const float* k_data,
     const float* v_data,
-    const float* mask_data,    
+    const uint8_t* mask_data,
     float* output_data,
     int batch_size,
     int num_heads,
@@ -20,21 +20,20 @@ torch::Tensor attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor 
     auto q_fp32 = q.to(torch::kFloat32);
     auto k_fp32 = k.to(torch::kFloat32);
     auto v_fp32 = v.to(torch::kFloat32);
-    auto mask_fp32 = mask.to(torch::kFloat32);
+    auto mask_u8 = mask.to(torch::kUInt8).contiguous();
 
     const int batch_size = q_fp32.size(0);
     const int num_heads = q_fp32.size(1);
     const int seq_len = q_fp32.size(2);
     const int head_dim = q_fp32.size(3);
 
-    torch::Tensor output = torch::empty_like(q);
     auto output_fp32 = torch::empty_like(q_fp32);
 
     attention_forward_cuda(
         q_fp32.data_ptr<float>(),
         k_fp32.data_ptr<float>(),
         v_fp32.data_ptr<float>(),
-        mask_fp32.data_ptr<float>(),
+        mask_u8.data_ptr<uint8_t>(),
         output_fp32.data_ptr<float>(),
         batch_size,
         num_heads,
@@ -42,9 +41,8 @@ torch::Tensor attention_forward(torch::Tensor q, torch::Tensor k, torch::Tensor 
         head_dim
     );
 
-    output.copy_(output_fp32);
-
-    return output;
+    // Cast back to original dtype of inputs for PyTorch expectations
+    return output_fp32.to(q.dtype());
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
