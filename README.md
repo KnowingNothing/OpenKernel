@@ -8,7 +8,7 @@
 
 # 题目说明
 
-题目基于字节跳动开源多模态模型Bagel的forward_train部分，选手需要在保证输出结果正确性通过验证的情况下，手动编写高性能attention算子合并到函数调用中，实现缩减训练时间的目标。
+题目基于字节跳动开源多模态模型Bagel的forward_train部分，选手需要在保证输出结果正确性通过验证的情况下，手动编写适用于训练场景的高性能attention算子合并到函数调用中，实现缩减算子运行时间的目标。
 
 现已为选手搭建好 custom operator 集成模块，核心可修改部分为 `multimodal/` 下的 `custom_kernel/custom_attention/custom_attention.cu`
 
@@ -31,11 +31,9 @@ multimodal/
 │   ├── setup.py                           # 自定义函数构建脚本
 │   └── verify.py                          # 自定义函数验证脚本
 ├── logs                                   # 任务输出日志
-├── README.md                              # （目前是构建初始环境的命令）
 ├── requirements.txt                       # conda 依赖项目录
 ├── run.py                                 # 算子性能测试脚本
-├── run.sh                                 # 任务提交脚本
-└── verify.py                              # 算子正确性验证脚本
+└── run.sh                                 # 任务提交脚本
 ```
 
 项目主要分为是自定义函数库以及顶层项目文件两个部分
@@ -52,11 +50,11 @@ multimodal/
 
 ### 程序运行及验证部分
 
-`run.sh`：集群任务提交脚本，实际运行 `run.py` / `verify.py` 脚本
+（`multimodal` 目录下）
 
-`verify.py`：算子正确性验证脚本，在相同数据集输入情况下对比 custom ops 与 Pytorch 原生算子的运算结果，进行正确性验证
+`run.sh`：集群任务提交脚本，实际运行 `run.py` 验证正确性和计时
 
-`run.py`：代码性能测试脚本，通过装饰器以及 torch.profiler 两种方式进行性能测试。装饰器计时部分在任务输出日志中可以直观获得，torch.profiler 计时数据保存在 `/log/` 下的指定文件夹中
+`run.py`：代码正确性和性能测试脚本，通过装饰器以及 torch.profiler 两种方式进行性能测试。装饰器计时部分在任务输出日志中可以直观获得，torch.profiler 计时数据保存在 `/log/` 下的指定文件夹中
 
 ![pipeline](imgs/pipeline.png)
 
@@ -93,7 +91,7 @@ git clone https://github.com/KnowingNothing/OpenKernel.git
 
 注意，每当你修改自定义函数后，都应重新编译自定义函数库。
 
-为了保证编译环境和运行环境一致，这里需要利用脚本提交到计算节点进行编译。而集群的计算节点不能联网，因此可以选择一种简单粗暴的方法：不适用 pip，直接编译出来 .so 文件，然后手动把它们复制到 conda 环境中。
+为了保证编译环境和运行环境一致，这里需要利用脚本提交到计算节点进行编译。而集群的计算节点不能联网，因此可以选择一种简单粗暴的方法：不适用 pip，直接编译出来 .so 文件，然后手动把它们复制到 conda 环境中。（编译后会执行verify.py首先验证自定义kernel正确性，可以自己选择是否取消）
 
 参考脚本：`custom_kernel/run.sh`
 
@@ -203,6 +201,8 @@ except Exception as e:
 "
 cd custom_kernel
 
+python verify.py
+
 echo "================================================================"
 echo "Job End Time: $(date)"
 echo "================================================================"
@@ -257,7 +257,6 @@ echo "----------------------------------------------------------------"
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.10/site-packages/torch/lib:$LD_LIBRARY_PATH
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
-# python verify.py
 python run.py
 
 echo "================================================================"
@@ -265,17 +264,24 @@ echo "Job End Time: $(date)"
 echo "================================================================"
 ```
 
-通过修改 multimodal 下的 `run.sh` 脚本，将其中的最终运行命令替换为`python verify.py`并提交运行：`sbatch --gpus=1 run.sh`，可以验证自定义算子正确性。
+> 可以在 `run.py` 文件中通过设置 `USE_CUSTOM_KERNEL`变量的布尔值，在 **Pytorch 实现** 与 **自定义实现** 之前切换对象。注意：最终提交版本需要使用**自定义实现**。
 
-![verity](imgs/verify.png)
-
-> 可以在 `run.py` 文件中通过设置 `USE_CUSTOM_KERNEL`变量的布尔值，在 **Pytorch 实现** 与 **自定义实现** 之前切换对象
-
-修改 `multimodal` 下的 `run.sh` 脚本，将其中的最终运行命令替换为 `python run.py` 并提交运行： `sbatch --gpus=1 run.sh`，可以获取运行时间：
+修改 `multimodal` 下的 `run.sh` 脚本，将其中的最终运行命令替换为 `python run.py` 并提交运行： `sbatch --gpus=1 run.sh`，可以获取运行时间：（同时也会验证自定义算子正确性）
 
 ![run](imgs/run.png)
 
 `python run.py` 执行后会在`./logs/train`下输出对应的采样文件
+
+### 总结
+
+（每次改完 custom kernel 代码后要运行）
+
+```sh
+cd /path/to/custom_kernel
+sbatch --gpus=1 run.sh
+cd ..
+sbatch --gpus=1 run.sh
+```
 
 # 参考文献
 
@@ -284,3 +290,5 @@ echo "================================================================"
 Attention Is All You Need ：[https://arxiv.org/abs/1706.03762](https://arxiv.org/abs/1706.03762)
 
 bagel开源仓库：[https://github.com/bytedance-seed/BAGEL](https://github.com/bytedance-seed/BAGEL)
+
+CUDA 编程指南：[CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html)
