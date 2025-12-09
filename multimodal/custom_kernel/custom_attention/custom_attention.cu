@@ -72,6 +72,7 @@ __global__ void matrix_multiply_kernel_naive(
     for (int i = 0; i < K; ++i) sum += A[row * K + i] * B[i * N + col];
 
     C[row * N + col] = sum;
+    // C[row * N + col] = sum + 1; // wrong test
 }
 
 // Host-side C++ function 

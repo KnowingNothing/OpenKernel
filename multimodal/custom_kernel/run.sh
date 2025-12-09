@@ -15,8 +15,8 @@ echo "Job ID: $SLURM_JOB_ID, Running on node: $(hostname), Start Time: $(date)"
 echo "================================================================"
 
 echo "Loading CUDA module..."
-module load cuda/12.4
-# spack load cuda@12.4.1 
+# module load cuda/12.4
+spack load cuda@12.4.1 
 echo "Activating Conda environment: bagel..."
 # Activate conda
 CONDA_BASE=$(conda info --base)

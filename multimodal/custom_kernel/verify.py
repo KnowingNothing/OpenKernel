@@ -18,7 +18,7 @@ num_heads = 4
 seq_len = 32  
 head_dim = 16   
 device = torch.device("cuda")
-dtype = torch.float32
+dtype = torch.float32 # You can change this to torch.float16 to test half precision
 
 q = torch.rand(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
 k = torch.rand(batch_size, num_heads, seq_len, head_dim, device=device, dtype=dtype)
@@ -57,18 +57,26 @@ try:
     output_pytorch = torch.matmul(attn_weights_pytorch, v)
     print("   PyTorch native operator executed successfully.")
 
-    # --- 5. Verify results ---
+    # --- 5. Verify results (Modified for Tiered Precision) ---
     print("\n[3] Verifying results...")
 
-    # Use allclose to compare floating-point tensors, atol is the absolute tolerance
-    are_outputs_close = torch.allclose(output_custom, output_pytorch, atol=1e-4)
+    # [核心修改] 分级精度验证逻辑
+    is_half = q.dtype in [torch.float16, torch.bfloat16]
+    
+    # 半精度允许 5e-3 (0.005) 误差，全精度严格要求 1e-5
+    atol_val = 5e-3 if is_half else 1e-5
+    rtol_val = 5e-3 if is_half else 1e-5
+    
+    # 使用混合误差验证 (Absolute + Relative)
+    are_outputs_close = torch.allclose(output_custom, output_pytorch, atol=atol_val, rtol=rtol_val)
 
     if are_outputs_close:
-        print("✅ SUCCESS: The outputs of the custom operator and PyTorch are consistent!")
+        print(f"✅ SUCCESS: The outputs are consistent! (atol={atol_val}, rtol={rtol_val})")
     else:
         print("❌ FAILURE: The outputs do not match.")
         difference = torch.abs(output_custom - output_pytorch).max().item()
         print(f"   Max absolute difference: {difference}")
+        print(f"   Threshold used: atol={atol_val}, rtol={rtol_val}")
 
     # Print a small slice of the output for visual comparison
     print("\n--- Output Slice Comparison ---")

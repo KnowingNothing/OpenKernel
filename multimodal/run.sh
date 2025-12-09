@@ -18,8 +18,8 @@ echo "================================================================"
 
 # The spack load command will automatically set environment variables like PATH and CUDA_HOME
 echo "Loading CUDA module..."
-# spack load cuda@12.4.1
-module load cuda/12.4
+spack load cuda@12.4.1
+# module load cuda/12.4
 
 # Activate Conda environment
 echo "Activating Conda environment: bagel..."
@@ -38,7 +38,11 @@ echo "----------------------------------------------------------------"
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$CONDA_PREFIX/lib/python3.10/site-packages/torch/lib:$LD_LIBRARY_PATH
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
-python run.py
+# cd /home/zhwh/OpenKernel/multimodal
+# echo $(pwd)
+# export PYTHONPATH=$PYTHONPATH:$(pwd)
+# echo $(ls)
+python run_multimodal.py
 
 echo "================================================================"
 echo "Job End Time: $(date)"
