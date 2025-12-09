@@ -18,8 +18,8 @@ echo "================================================================"
 
 # The spack load command will automatically set environment variables like PATH and CUDA_HOME
 echo "Loading CUDA module..."
-spack load cuda@12.4.1
-# module load cuda/12.4
+# spack load cuda@12.4.1
+module load cuda/12.4
 
 # Activate Conda environment
 echo "Activating Conda environment: bagel..."
@@ -42,7 +42,7 @@ export PYTHONPATH=$(pwd):$PYTHONPATH
 # echo $(pwd)
 # export PYTHONPATH=$PYTHONPATH:$(pwd)
 # echo $(ls)
-python run_multimodal.py
+python run.py
 
 echo "================================================================"
 echo "Job End Time: $(date)"
